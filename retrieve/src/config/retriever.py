@@ -12,8 +12,21 @@ class DDEYaml(pydantic.BaseModel):
     num_reverse_rounds: int
 
 class RetrieverYaml(pydantic.BaseModel):
+    """
+    Retriever configuration for SubgraphRAG.
+    
+    gnn_num_layers: Number of GraphSAGE layers (in webqsp.yaml) directly controls
+                    the GraphSAGE depth via the number of SAGEConv layers in 
+                    Retriever.convs. Set to 0 to disable GNN entirely.
+    gnn_hidden_dim: Hidden dimension for GNN layers. If None, defaults to emb_size.
+    gnn_dropout: Dropout rate applied after each GNN layer (except the last).
+    """
     topic_pe: bool
     DDE_kwargs: DDEYaml
+    # GNN parameters - these control GraphSAGE depth and behavior
+    gnn_num_layers: int = 2
+    gnn_hidden_dim: int | None = None
+    gnn_dropout: float = 0.0
 
 class OptimizerYaml(pydantic.BaseModel):
     lr: float

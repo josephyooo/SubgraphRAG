@@ -13,6 +13,9 @@ retriever:
   DDE_kwargs:
     num_rounds: 2
     num_reverse_rounds: 2
+  gnn_num_layers: 1
+  gnn_hidden_dim: null
+  gnn_dropout: 0.0
 
 optimizer:
   lr: 1e-3

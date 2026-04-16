@@ -125,6 +125,23 @@ def main(args):
     model = Retriever(emb_size, **config['retriever']).to(device)
     optimizer = Adam(model.parameters(), **config['optimizer'])
 
+    # ============ DEBUG: Verify GNN configuration wiring ============
+    # This section confirms that gnn_num_layers in webqsp.yaml is correctly
+    # passed to the Retriever and controls the number of SAGEConv layers.
+    # Remove or comment out after verification.
+    print("=" * 60)
+    print("DEBUG: Verifying GNN configuration wiring")
+    print(f"  Retriever config: gnn_num_layers={config['retriever'].get('gnn_num_layers', 'NOT FOUND')}")
+    print(f"  Model.gnn_num_layers={model.gnn_num_layers}")
+    print(f"  len(model.convs)={len(model.convs)}")
+    print(f"  gnn_hidden_dim={model.gnn_hidden_dim}, gnn_dropout={model.gnn_dropout}")
+    if model.gnn_num_layers != len(model.convs):
+        print("  WARNING: gnn_num_layers does not match len(convs)!")
+    else:
+        print("  OK: gnn_num_layers matches len(convs)")
+    print("=" * 60)
+    # ============ END DEBUG ============
+
     num_patient_epochs = 0
     best_val_metric = 0
     for epoch in range(config['train']['num_epochs']):

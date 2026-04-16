@@ -1,8 +1,10 @@
 import os
+import re
 import json
 import wandb
 import random
 import argparse
+from datetime import datetime
 from tqdm import tqdm
 from pathlib import Path
 
@@ -12,6 +14,44 @@ from llm_utils import llm_init, llm_inf_all
 
 from metrics.evaluate_results_corrected import eval_results as eval_results_corrected
 from metrics.evaluate_results import eval_results as eval_results_original
+
+
+def build_run_tag(args) -> str:
+    """
+    Build a unique run identifier (run_tag) for this reasoning run.
+    
+    This tag is used to make prediction filenames unique, allowing multiple
+    reasoner runs to execute in parallel without file collisions.
+    
+    Priority:
+    1. If args.run_tag is explicitly provided, use it directly.
+    2. Otherwise, derive from the retrieval checkpoint path (args.score_dict_path).
+       - Extract the parent directory name (e.g., "webqsp_Dec04-07:08:00").
+       - Sanitize it by replacing colons, spaces, and other problematic chars with "-".
+    3. If no path is available, fall back to a timestamp-based tag.
+    
+    Returns:
+        A sanitized string suitable for use in filenames.
+    """
+    if args.run_tag is not None:
+        # Use explicit run_tag, but sanitize it for safety
+        tag = args.run_tag
+    elif args.score_dict_path is not None:
+        # Derive from retrieval checkpoint path
+        # Get parent directory name from path like "../retrieve/webqsp_Dec04-07:08:00/retrieval_result.pth"
+        path = Path(args.score_dict_path)
+        parent_name = path.parent.name
+        tag = parent_name
+    else:
+        # Fallback to timestamp
+        tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Sanitize the tag: replace colons, spaces, and other problematic characters with "-"
+    tag = re.sub(r'[:\s/\\]+', '-', tag)
+    # Remove any leading/trailing dashes and collapse multiple dashes
+    tag = re.sub(r'-+', '-', tag).strip('-')
+    
+    return tag
 
 
 def get_defined_prompts(prompt_mode, model_name, llm_mode):
@@ -103,6 +143,11 @@ def main():
     parser.add_argument("--temperature", type=float, default=0, help="Temperature")
     parser.add_argument("--frequency_penalty", type=float, default=0.16, help="Frequency penalty")
     parser.add_argument("--thres", type=float, default=0.0, help="Threshold")
+    # Optional run tag for unique prediction filenames (allows parallel runs)
+    parser.add_argument("--run_tag", type=str, default=None,
+                        help="Optional unique identifier for this run. If not provided, derived from "
+                             "score_dict_path or timestamp. Used to create unique prediction filenames "
+                             "for parallel execution safety.")
 
     args = parser.parse_args()
     dataset_name = args.dataset_name
@@ -118,8 +163,13 @@ def main():
     frequency_penalty = args.frequency_penalty
     thres = args.thres
 
+    # Build a unique run_tag for this run to allow parallel executions without file collisions.
+    # This tag is incorporated into prediction filenames.
+    run_tag = build_run_tag(args)
+    print(f"Using run_tag: {run_tag}")
+
     pred_file_path = f"./results/KGQA/{dataset_name}/RoG/{split}/results_gen_rule_path_RoG-{dataset_name}_RoG_{split}_predictions_3_False_jsonl/predictions.jsonl"
-    run_name = f"{model_name}-{prompt_mode}-{llm_mode}-{frequency_penalty}-thres_{thres}-{split}"
+    run_name = f"{model_name}-{prompt_mode}-{llm_mode}-{frequency_penalty}-thres_{thres}-{split}-{run_tag}"
     run = wandb.init(project=f"RAG-{dataset_name}", name=run_name, config=args)
 
     if args.score_dict_path is None:
@@ -132,9 +182,21 @@ def main():
     else:
         score_dict_path = args.score_dict_path
 
+    # Create results directory
     raw_pred_folder_path = Path(f"./results/KGQA/{dataset_name}/SubgraphRAG/{args.model_name.split('/')[-1]}")
     raw_pred_folder_path.mkdir(parents=True, exist_ok=True)
-    raw_pred_file_path = raw_pred_folder_path / f"{prompt_mode}-{llm_mode}-{frequency_penalty}-thres_{thres}-{split}-predictions-resume.jsonl"
+    
+    # Prediction filename construction:
+    # The run_tag is used to allow multiple reasoner runs in parallel without file collisions.
+    # Prediction filenames follow the pattern:
+    #   <prompt_mode>-<llm_mode>-<frequency_penalty>-thres_<thres>-<run_tag>-<split>-predictions[-resume].jsonl
+    # 
+    # Examples:
+    #   scored_100-sys_icl_dc-0.16-thres_0.0-webqsp_Dec04-07-08-00-test-predictions.jsonl
+    #   scored_100-sys_icl_dc-0.16-thres_0.0-my_custom_tag-test-predictions.jsonl
+    base_name = f"{prompt_mode}-{llm_mode}-{frequency_penalty}-thres_{thres}-{run_tag}-{split}-predictions"
+    raw_pred_file_path = raw_pred_folder_path / f"{base_name}-resume.jsonl"
+    final_pred_file_path = raw_pred_folder_path / f"{base_name}.jsonl"
 
     llm = llm_init(model_name, tensor_parallel_size, max_seq_len_to_capture, max_tokens, seed, temperature, frequency_penalty)
     data = get_data(dataset_name, pred_file_path, score_dict_path, split, prompt_mode)
@@ -143,6 +205,7 @@ def main():
     data = get_prompts_for_data(data, prompt_mode, sys_prompt, cot_prompt, thres)
 
     print("Starting inference...")
+    # Resume logic: check for existing resume file for THIS run_tag only
     start_idx = len(load_checkpoint(raw_pred_file_path))
     with open(raw_pred_file_path, "a") as pred_file:
         for idx, each_qa in enumerate(tqdm(data[start_idx:], initial=start_idx, total=len(data))):
@@ -153,9 +216,19 @@ def main():
             each_qa["prediction"] = res[0]
             save_checkpoint(pred_file, each_qa)
 
-    # If the processing completes, rename the files to remove the "resume" flag
-    final_pred_file_path = raw_pred_file_path.with_name(raw_pred_file_path.stem.replace("-resume", "") + raw_pred_file_path.suffix)
-    os.rename(raw_pred_file_path, final_pred_file_path)
+    # If the processing completes, rename the resume file to final file
+    # Check if the resume file exists before attempting rename (robustness for edge cases)
+    if os.path.exists(raw_pred_file_path):
+        os.rename(raw_pred_file_path, final_pred_file_path)
+    elif not os.path.exists(final_pred_file_path):
+        # Neither file exists - this shouldn't happen, but handle gracefully
+        raise FileNotFoundError(
+            f"Neither resume file ({raw_pred_file_path}) nor final file ({final_pred_file_path}) exists. "
+            "Cannot proceed with evaluation."
+        )
+    # else: final_pred_file_path already exists (resume file was already renamed or didn't exist)
+    
+    # Evaluate using the run_tag-specific final prediction file
     eval_all(final_pred_file_path, run, subset=True)
     eval_all(final_pred_file_path, run, subset=False)
 
